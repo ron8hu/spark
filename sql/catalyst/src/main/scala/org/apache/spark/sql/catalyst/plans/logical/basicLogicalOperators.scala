@@ -113,6 +113,13 @@ case class Filter(condition: Expression, child: LogicalPlan)
       .filterNot(SubqueryExpression.hasCorrelatedSubquery)
     child.constraints.union(predicates.toSet)
   }
+
+  /*
+  override lazy val statistics: Statistics = {
+    FilterCardEstimator(this)
+  }
+  */
+
 }
 
 abstract class SetOperation(left: LogicalPlan, right: LogicalPlan) extends BinaryNode {

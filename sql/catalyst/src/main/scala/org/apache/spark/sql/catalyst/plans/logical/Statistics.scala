@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
+import org.apache.spark.sql.types.DataType
+
 /**
  * Estimates of various statistics.  The default estimation logic simply lazily multiplies the
  * corresponding statistic produced by the children.  To override this behavior, override
@@ -32,19 +34,100 @@ package org.apache.spark.sql.catalyst.plans.logical
  * @param sizeInBytes Physical size in bytes. For leaf operators this defaults to 1, otherwise it
  *                    defaults to the product of children's `sizeInBytes`.
  * @param rowCount Estimated number of rows.
+ * @param colStats Column-level statistics.
  * @param isBroadcastable If true, output is small enough to be used in a broadcast join.
  */
 case class Statistics(
     sizeInBytes: BigInt,
     rowCount: Option[BigInt] = None,
+    colStats: Map[String, ColumnStats] = Map.empty,
     isBroadcastable: Boolean = false) {
+
   override def toString: String = "Statistics(" + simpleString + ")"
 
   /** Readable string representation for the Statistics. */
   def simpleString: String = {
     Seq(s"sizeInBytes=$sizeInBytes",
       if (rowCount.isDefined) s"rowCount=${rowCount.get}" else "",
+      if (colStats.nonEmpty) s"colStats=$colStats" else "",
       s"isBroadcastable=$isBroadcastable"
-    ).filter(_.nonEmpty).mkString("", ", ", "")
+    ).filter(_.nonEmpty).mkString(", ")
+  }
+
+}
+
+/**
+ * Statistics for a column.
+ * @param ndv Number of distinct values of the column.
+ */
+case class ColumnStats(
+    dataType: DataType,
+    numNulls: Long,
+    max: Option[Any] = None,
+    min: Option[Any] = None,
+    ndv: Option[Long] = None,
+    avgColLen: Option[Double] = None,
+    maxColLen: Option[Long] = None,
+    numTrues: Option[Long] = None,
+    numFalses: Option[Long] = None,
+    histogram: Option[Histogram] = None) {
+
+  override def toString: String = "ColumnStats(" + simpleString + ")"
+
+  def simpleString: String = {
+    Seq(s"numNulls=$numNulls",
+      if (max.isDefined) s"max=${max.get}" else "",
+      if (min.isDefined) s"min=${min.get}" else "",
+      if (ndv.isDefined) s"ndv=${ndv.get}" else "",
+      if (avgColLen.isDefined) s"avgColLen=${avgColLen.get}" else "",
+      if (maxColLen.isDefined) s"maxColLen=${maxColLen.get}" else "",
+      if (numTrues.isDefined) s"numTrues=${numTrues.get}" else "",
+      if (numFalses.isDefined) s"numFalses=${numFalses.get}" else ""
+    ).filter(_.nonEmpty).mkString(", ")
   }
 }
+
+object ColumnStats {
+  def fromString(str: String, dataType: DataType): ColumnStats = {
+    val suffix = ",\\s|\\)"
+    ColumnStats(
+      dataType = dataType,
+      numNulls = findItem(source = str, prefix = "numNulls=", suffix = suffix).map(_.toLong).get,
+      max = findItem(source = str, prefix = "max=", suffix = suffix),
+      min = findItem(source = str, prefix = "min=", suffix = suffix),
+      ndv = findItem(source = str, prefix = "ndv=", suffix = suffix).map(_.toLong),
+      avgColLen = findItem(source = str, prefix = "avgColLen=", suffix = suffix).map(_.toDouble),
+      maxColLen = findItem(source = str, prefix = "maxColLen=", suffix = suffix).map(_.toLong),
+      numTrues = findItem(source = str, prefix = "numTrues=", suffix = suffix).map(_.toLong),
+      numFalses = findItem(source = str, prefix = "numFalses=", suffix = suffix).map(_.toLong))
+  }
+
+  private def findItem(source: String, prefix: String, suffix: String): Option[String] = {
+    val pattern = s"(?<=$prefix)(.+?)(?=$suffix)".r
+    pattern.findFirstIn(source)
+  }
+}
+
+trait Histogram
+trait EquiWidthHgm extends Histogram
+trait EquiHeightHgm extends Histogram
+
+case class NumericEquiWidthHgm(bins: Array[NumericEquiWidthBin]) extends EquiWidthHgm
+case class StringEquiWidthHgm(bins: Array[StringEquiWidthBin]) extends EquiWidthHgm
+case class NumericEquiHeightHgm(
+    bins: Array[NumericEquiHeightBin],
+    binFrequency: BigDecimal) extends EquiHeightHgm
+
+case class NumericEquiWidthBin(value: Double, frequency: Long)
+case class StringEquiWidthBin(value: String, frequency: Long)
+
+/**
+ * Single bin used in a numeric equal height histogram
+ * @param lb is the lower bound value of a histogram bin.  Every value in the bin is
+ *           greater than lb.
+ * @param ub is the upper bound value of a histogram bin.  Every value in the bin is
+ *           less than or equal to ub.
+ * @param binNdv is the total number of distinct values in a given bin.
+ */
+
+case class NumericEquiHeightBin(lb: Double, ub: Double, binNdv: Long)
