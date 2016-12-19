@@ -30,40 +30,36 @@ import org.apache.spark.unsafe.types.UTF8String
 
 object FilterEstimation extends Logging {
 
-  // We use a mutable colStats because we need to update the corresponding ColumnStat
-  // for a column after we apply a predicate condition.
+  /**
+   * We use a mutable colStats because we need to update the corresponding ColumnStat
+   * for a column after we apply a predicate condition.
+   */
   private val mutableColStats: mutable.Map[String, ColumnStat] = mutable.Map.empty[String, ColumnStat]
 
-  def estimate(plan: Filter)
-    : Option[Statistics] = {
+  def estimate(plan: Filter): Option[Statistics] = {
     val stats: Statistics = plan.child.statistics
     if (stats.rowCount.isEmpty) return None
 
-    copyFromColStats(stats.colStats)
-    // estimate selectivity for this filter
-    val percent: Double = calculateConditions(stats, plan.condition)
-    val filteredSizeInBytes = RoundingToBigInt(BigDecimal(stats.sizeInBytes) * percent)
-    val filteredRowCount = stats.rowCount.map(
-      r => RoundingToBigInt(BigDecimal(r) * percent)
-    )
-
-    Some(stats.copy(sizeInBytes = filteredSizeInBytes, rowCount = filteredRowCount,
-      colStats = copyToColStats))
-  }
-
-  // save local copy of colStats so that we may update it
-  def copyFromColStats(colStats: Map[String, ColumnStat]): Unit = {
-    for ( (k, v) <- colStats ) {
+    /** save a mutable copy of colStats so that we can later change it recursively */
+    for ( (k, v) <- stats.colStats ) {
       mutableColStats += (k -> v)
     }
-  }
-  // return the updated colStats to the calling method.
-  def copyToColStats: Map[String, ColumnStat] = {
-    var stats: Map[String, ColumnStat] = Map.empty[String, ColumnStat]
+
+    /** estimate selectivity for this filter */
+    val percent: Double = calculateConditions(stats, plan.condition)
+    val filteredSizeInBytes = EstimationUtils.ceil(BigDecimal(stats.sizeInBytes) * percent)
+    val filteredRowCount = stats.rowCount.map(
+      r => EstimationUtils.ceil(BigDecimal(r) * percent)
+    )
+
+    /** copy mutableColStats contents to a immutable map */
+    var newColStats: Map[String, ColumnStat] = Map.empty[String, ColumnStat]
     for ( (k, v) <- mutableColStats ) {
-      stats = stats + (k -> v)
+      newColStats = newColStats + (k -> v)
     }
-    stats
+
+    Some(stats.copy(sizeInBytes = filteredSizeInBytes, rowCount = filteredRowCount,
+      colStats = newColStats))
   }
 
   def calculateConditions(
@@ -71,8 +67,11 @@ object FilterEstimation extends Logging {
       condition: Expression,
       update: Boolean = true)
     : Double = {
-    // For conditions linked by And, we need to update stats after a condition estimation
-    // so that the stats will be more accurate for subsequent estimation.
+    /**
+     * For conditions linked by And, we need to update stats after a condition estimation
+     * so that the stats will be more accurate for subsequent estimation.
+     * For conditions linked by OR, we do not update stats after a condition estimation.
+     */
     condition match {
       case And(cond1, cond2) =>
         calculateConditions(planStat, cond1, update) * calculateConditions(planStat, cond2, update)
@@ -92,56 +91,58 @@ object FilterEstimation extends Logging {
     : Double = {
     var notSupported: Boolean = false
     val percent: Double = condition match {
-      // Currently we only support binary predicates where one side is a column,
-      // and the other is a literal.
-      // Note that: all binary predicate computing methods assume the literal is at the right side,
-      // so we will change the predicate order if not.
-      case op@LessThan(ExtractAttrRef(ar), l: Literal) =>
+      /**
+       * Currently we only support binary predicates where one side is a column,
+       * and the other is a literal.
+       * Note that: all binary predicate computing methods assume the literal is at the right side,
+       * so we will change the predicate order if not.
+       */
+      case op@LessThan(ExtractAttr(ar), l: Literal) =>
         evaluateBinary(op, planStat, ar, l, update)
-      case op@LessThan(l: Literal, ExtractAttrRef(ar)) =>
+      case op@LessThan(l: Literal, ExtractAttr(ar)) =>
         evaluateBinary(GreaterThan(ar, l), planStat, ar, l, update)
 
-      case op@LessThanOrEqual(ExtractAttrRef(ar), l: Literal) =>
+      case op@LessThanOrEqual(ExtractAttr(ar), l: Literal) =>
         evaluateBinary(op, planStat, ar, l, update)
-      case op@LessThanOrEqual(l: Literal, ExtractAttrRef(ar)) =>
+      case op@LessThanOrEqual(l: Literal, ExtractAttr(ar)) =>
         evaluateBinary(GreaterThanOrEqual(ar, l), planStat, ar, l, update)
 
-      case op@GreaterThan(ExtractAttrRef(ar), l: Literal) =>
+      case op@GreaterThan(ExtractAttr(ar), l: Literal) =>
         evaluateBinary(op, planStat, ar, l, update)
-      case op@GreaterThan(l: Literal, ExtractAttrRef(ar)) =>
+      case op@GreaterThan(l: Literal, ExtractAttr(ar)) =>
         evaluateBinary(LessThan(ar, l), planStat, ar, l, update)
 
-      case op@GreaterThanOrEqual(ExtractAttrRef(ar), l: Literal) =>
+      case op@GreaterThanOrEqual(ExtractAttr(ar), l: Literal) =>
         evaluateBinary(op, planStat, ar, l, update)
-      case op@GreaterThanOrEqual(l: Literal, ExtractAttrRef(ar)) =>
+      case op@GreaterThanOrEqual(l: Literal, ExtractAttr(ar)) =>
         evaluateBinary(LessThanOrEqual(ar, l), planStat, ar, l, update)
 
-      // EqualTo does not care about the order
-      case op@EqualTo(ExtractAttrRef(ar), l: Literal) =>
+      /** EqualTo does not care about the order */
+      case op@EqualTo(ExtractAttr(ar), l: Literal) =>
         evaluateBinary(op, planStat, ar, l, update)
-      case op@EqualTo(l: Literal, ExtractAttrRef(ar)) =>
+      case op@EqualTo(l: Literal, ExtractAttr(ar)) =>
         evaluateBinary(op, planStat, ar, l, update)
 
-      case In(ExtractAttrRef(ar), expList) if !expList.exists(!_.isInstanceOf[Literal]) =>
-        // Expression [In (value, seq[Literal])] will be replaced with optimized version
-        // [InSet (value, HashSet[Literal])] in Optimizer, but only for list.size > 10.
-        // Here we convert In into InSet anyway, because they share the same processing logic.
+      case In(ExtractAttr(ar), expList) if !expList.exists(!_.isInstanceOf[Literal]) =>
+        /**
+         * Expression [In (value, seq[Literal])] will be replaced with optimized version
+         * [InSet (value, HashSet[Literal])] in Optimizer, but only for list.size > 10.
+         * Here we convert In into InSet anyway, because they share the same processing logic.
+         */
         val hSet = expList.map(e => e.eval())
         evaluateInSet(planStat, ar, HashSet() ++ hSet, update)
-      case InSet(ExtractAttrRef(ar), set) =>
+
+      case InSet(ExtractAttr(ar), set) =>
         evaluateInSet(planStat, ar, set, update)
 
       case Like(_, _) | Contains(_, _) | StartsWith(_, _) | EndsWith(_, _) =>
         evaluateLike(condition, planStat, update)
 
       // TODO: it's difficult to estimate IsNull after outer joins
-      // case IsNull(ExtractAttrRef(ar)) =>
+      // case IsNull(ExtractAttr(ar)) =>
       // evaluateIsNull(planStat, ar, update)
-      case IsNotNull(ExtractAttrRef(ar)) =>
+      case IsNotNull(ExtractAttr(ar)) =>
         evaluateIsNotNull(planStat, ar, update)
-
-      // case op @ EqualNullSafe(ExtractAttrRef(ar), l: Literal) =>
-      // case op @ EqualNullSafe(l: Literal, ExtractAttrRef(ar)) =>
 
       case _ =>
         logDebug("[CBO] Unsupported filter condition: " + condition)
@@ -180,7 +181,7 @@ object FilterEstimation extends Logging {
     1.0 - percent.toDouble
   }
 
-  // This method evaluates binary comparison operators such as =, <, <=, >, >=
+  /** This method evaluates binary comparison operators such as =, <, <=, >, >= */
   def evaluateBinary(
       op: BinaryComparison,
       planStat: Statistics,
@@ -205,7 +206,7 @@ object FilterEstimation extends Logging {
     }
   }
 
-  // This method evaluates the equality predicate for all data types.
+  /** This method evaluates the equality predicate for all data types. */
   def evaluateEqualTo(
       op: BinaryComparison,
       planStat: Statistics,
@@ -256,9 +257,11 @@ object FilterEstimation extends Logging {
       case _ => ""
     }
 
-    // decide if the value is in [min, max] of the column.
-    // We currently don't store min/max for binary/string type.
-    // Hence, we assume it is in boundary for binary/string type.
+    /**
+     * decide if the value is in [min, max] of the column.
+     * We currently don't store min/max for binary/string type.
+     * Hence, we assume it is in boundary for binary/string type.
+     */
     val inBoundary: Boolean = attrRef.dataType match {
       case dataType: DataType if (dataType.isInstanceOf[NumericType]
         || dataType.isInstanceOf[DateType]
@@ -275,8 +278,10 @@ object FilterEstimation extends Logging {
       percent = 1.0 / ndv.toDouble
 
       if (update) {
-        // We update ColumnStat structure after apply this equality predicate.
-        // Set distinctCount to 1.  Set nullCount to 0.
+        /**
+         * We update ColumnStat structure after apply this equality predicate.
+         * Set distinctCount to 1.  Set nullCount to 0.
+         */
         val oneBigInt: BigInt = 1
         val zeroBigInt: BigInt = 0
         val newStats = attrRef.dataType match {
