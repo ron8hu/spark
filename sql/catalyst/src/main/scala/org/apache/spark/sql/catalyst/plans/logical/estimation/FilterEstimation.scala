@@ -75,9 +75,16 @@ object FilterEstimation extends Logging {
     condition match {
       case And(cond1, cond2) =>
         calculateConditions(planStat, cond1, update) * calculateConditions(planStat, cond2, update)
+
       case Or(cond1, cond2) =>
+        /**
+         * The following predicate selectivity may over estimate the selectivity of the compound
+         * conditions because we add the selectivities of two conditions together.  This way can
+         * avoid out-of-memory for the subsequent operations such as building a hash table.
+         */
         math.min(1.0, calculateConditions(planStat, cond1, update = false) +
           calculateConditions(planStat, cond2, update = false))
+
       case Not(cond) => calculateSingleCondition(planStat, cond, isNot = true, update = false)
       case _ => calculateSingleCondition(planStat, condition, isNot = false, update)
     }

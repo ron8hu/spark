@@ -39,10 +39,10 @@ class FilterEstimationSuite extends QueryTest with SharedSQLContext {
     withTable(table1) {
       df1.write.saveAsTable(table1)
 
-      // Collect statistics
+      /** Collect statistics */
       sql(s"analyze table $table1 compute STATISTICS FOR COLUMNS key1")
 
-      // Validate statistics
+      /** Validate statistics */
       val logicalPlan =
         sql(s"select * from $table1 where key1=2").queryExecution.optimizedPlan
       val filterNodes = logicalPlan.collect {
