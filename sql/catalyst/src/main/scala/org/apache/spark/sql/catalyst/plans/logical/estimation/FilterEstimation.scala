@@ -34,7 +34,8 @@ object FilterEstimation extends Logging {
    * We use a mutable colStats because we need to update the corresponding ColumnStat
    * for a column after we apply a predicate condition.
    */
-  private val mutableColStats: mutable.Map[String, ColumnStat] = mutable.Map.empty[String, ColumnStat]
+  private val mutableColStats: mutable.Map[String, ColumnStat]
+    = mutable.Map.empty[String, ColumnStat]
 
   def estimate(plan: Filter): Option[Statistics] = {
     val stats: Statistics = plan.child.statistics
@@ -47,15 +48,17 @@ object FilterEstimation extends Logging {
 
     /** estimate selectivity for this filter */
     val percent: Double = calculateConditions(stats, plan.condition)
-    val filteredSizeInBytes = EstimationUtils.ceil(BigDecimal(stats.sizeInBytes) * percent)
+
+    /** copy mutableColStats contents to an immutable map */
+    val newColStats = mutableColStats.toMap
+
     val filteredRowCount = stats.rowCount.map(
       r => EstimationUtils.ceil(BigDecimal(r) * percent)
     )
-
-    /** copy mutableColStats contents to a immutable map */
-    var newColStats: Map[String, ColumnStat] = Map.empty[String, ColumnStat]
-    for ( (k, v) <- mutableColStats ) {
-      newColStats = newColStats + (k -> v)
+    val avgRowSize = BigDecimal(EstimationUtils.getRowSize(plan.output, newColStats))
+    val filteredSizeInBytes: BigInt = filteredRowCount match {
+      case Some(r) => EstimationUtils.ceil(BigDecimal(r) * avgRowSize)
+      case None => 0
     }
 
     Some(stats.copy(sizeInBytes = filteredSizeInBytes, rowCount = filteredRowCount,
@@ -143,11 +146,16 @@ object FilterEstimation extends Logging {
         evaluateInSet(planStat, ar, set, update)
 
       case Like(_, _) | Contains(_, _) | StartsWith(_, _) | EndsWith(_, _) =>
-        evaluateLike(condition, planStat, update)
+        /** TODO: it's difficult to support LIKE operator without histogram */
+        logInfo("[CBO] Unsupported filter condition: " + condition)
+        notSupported = true
+        1.0
 
-      // TODO: it's difficult to estimate IsNull after outer joins
-      // case IsNull(ExtractAttr(ar)) =>
-      // evaluateIsNull(planStat, ar, update)
+      /**
+       * TODO: it's difficult to estimate IsNull after outer joins
+       * case IsNull(ExtractAttr(ar)) =>
+       * evaluateIsNull(planStat, ar, update)
+       */
       case IsNotNull(ExtractAttr(ar)) =>
         evaluateIsNotNull(planStat, ar, update)
 
@@ -204,11 +212,20 @@ object FilterEstimation extends Logging {
       case EqualTo(l, r) => evaluateEqualTo(op, planStat, attrRef, literal, update)
       case _ =>
         attrRef.dataType match {
-          case StringType => evaluateBinaryForString(op, planStat, attrRef, literal, update)
           case dataType: DataType if (dataType.isInstanceOf[NumericType]
             || dataType.isInstanceOf[DateType]
             || dataType.isInstanceOf[TimestampType]) =>
             evaluateBinaryForNumeric(op, planStat, attrRef, literal, update)
+          case StringType =>
+            /**
+             * TODO: It is difficult to support other binary comparisons for String/Binary
+             * type without min/max and histogram.
+             */
+            logInfo("[CBO] No statistics for String type " + attrRef)
+            return 1.0
+          case BinaryType =>
+            logInfo("[CBO] No statistics for Binary type " + attrRef)
+            return 1.0
         }
     }
   }
@@ -289,16 +306,14 @@ object FilterEstimation extends Logging {
          * We update ColumnStat structure after apply this equality predicate.
          * Set distinctCount to 1.  Set nullCount to 0.
          */
-        val oneBigInt: BigInt = 1
-        val zeroBigInt: BigInt = 0
         val newStats = attrRef.dataType match {
           case dataType: DataType if (dataType.isInstanceOf[NumericType]
             || dataType.isInstanceOf[DateType]
             || dataType.isInstanceOf[TimestampType]) =>
             val newValue = Some(datumString.toDouble)
-            aColStat.copy(distinctCount = oneBigInt, min = newValue,
-              max = newValue, nullCount = zeroBigInt)
-          case _ => aColStat.copy(distinctCount = oneBigInt, nullCount = zeroBigInt)
+            aColStat.copy(distinctCount = 1, min = newValue,
+              max = newValue, nullCount = 0)
+          case _ => aColStat.copy(distinctCount = 1, nullCount = 0)
         }
         mutableColStats += (attrRef.name -> newStats)
       }
@@ -329,26 +344,6 @@ object FilterEstimation extends Logging {
       planStat: Statistics,
       attrRef: AttributeReference,
       literal: Literal,
-      update: Boolean)
-    : Double = {
-    // TODO: will fill in this method later.
-    1.0
-  }
-
-  def evaluateBinaryForString(
-      op: BinaryComparison,
-      planStat: Statistics,
-      attrRef: AttributeReference,
-      literal: Literal,
-      update: Boolean)
-    : Double = {
-    // TODO: will fill in this method later.
-    1.0
-  }
-
-  def evaluateLike(
-      cond: Expression,
-      planStat: Statistics,
       update: Boolean)
     : Double = {
     // TODO: will fill in this method later.

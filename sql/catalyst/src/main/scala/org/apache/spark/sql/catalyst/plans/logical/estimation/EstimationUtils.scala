@@ -21,14 +21,28 @@ import scala.math.BigDecimal.RoundingMode
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Cast, Expression}
-import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.ColumnStat
 import org.apache.spark.sql.types.StringType
 
 object EstimationUtils extends Logging {
 
   def ceil(bigDecimal: BigDecimal): BigInt = bigDecimal.setScale(0, RoundingMode.CEILING).toBigInt()
 
+  def getRowSize(attributes: Seq[Attribute], colStats: Map[String, ColumnStat]): Long = {
+    attributes.map { attr =>
+      if (colStats.contains(attr.name)) {
+        attr.dataType match {
+          case StringType =>
+            // base + offset + numBytes
+            colStats(attr.name).avgLen + 8 + 4
+          case _ =>
+            colStats(attr.name).avgLen
+        }
+      } else {
+        attr.dataType.defaultSize
+      }
+    }.sum
+  }
 }
 
 /** Attribute Reference extractor */
