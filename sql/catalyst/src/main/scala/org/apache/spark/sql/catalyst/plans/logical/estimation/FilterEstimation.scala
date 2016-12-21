@@ -34,17 +34,15 @@ object FilterEstimation extends Logging {
    * We use a mutable colStats because we need to update the corresponding ColumnStat
    * for a column after we apply a predicate condition.
    */
-  private val mutableColStats: mutable.Map[String, ColumnStat]
-    = mutable.Map.empty[String, ColumnStat]
+  private var mutableColStats: mutable.Map[String, ColumnStat] = mutable.Map.empty
+  // private val mutableColStats: mutable.Map[String, ColumnStat] = mutable.Map.empty
 
   def estimate(plan: Filter): Option[Statistics] = {
     val stats: Statistics = plan.child.statistics
     if (stats.rowCount.isEmpty) return None
 
     /** save a mutable copy of colStats so that we can later change it recursively */
-    for ( (k, v) <- stats.colStats ) {
-      mutableColStats += (k -> v)
-    }
+    mutableColStats = mutable.HashMap(stats.colStats.toSeq: _*)
 
     /** estimate selectivity for this filter */
     val percent: Double = calculateConditions(stats, plan.condition)
@@ -52,16 +50,13 @@ object FilterEstimation extends Logging {
     /** copy mutableColStats contents to an immutable map */
     val newColStats = mutableColStats.toMap
 
-    val filteredRowCount = stats.rowCount.map(
-      r => EstimationUtils.ceil(BigDecimal(r) * percent)
-    )
+    val filteredRowCountValue: BigInt =
+      EstimationUtils.ceil(BigDecimal(stats.rowCount.get) * percent)
     val avgRowSize = BigDecimal(EstimationUtils.getRowSize(plan.output, newColStats))
-    val filteredSizeInBytes: BigInt = filteredRowCount match {
-      case Some(r) => EstimationUtils.ceil(BigDecimal(r) * avgRowSize)
-      case None => 0
-    }
+    val filteredSizeInBytes: BigInt =
+      EstimationUtils.ceil(BigDecimal(filteredRowCountValue) * avgRowSize)
 
-    Some(stats.copy(sizeInBytes = filteredSizeInBytes, rowCount = filteredRowCount,
+    Some(stats.copy(sizeInBytes = filteredSizeInBytes, rowCount = Some(filteredRowCountValue),
       colStats = newColStats))
   }
 
@@ -80,13 +75,9 @@ object FilterEstimation extends Logging {
         calculateConditions(planStat, cond1, update) * calculateConditions(planStat, cond2, update)
 
       case Or(cond1, cond2) =>
-        /**
-         * The following predicate selectivity may over estimate the selectivity of the compound
-         * conditions because we add the selectivities of two conditions together.  This way can
-         * avoid out-of-memory for the subsequent operations such as building a hash table.
-         */
-        math.min(1.0, calculateConditions(planStat, cond1, update = false) +
-          calculateConditions(planStat, cond2, update = false))
+        val p1 = calculateConditions(planStat, cond1, update = false)
+        val p2 = calculateConditions(planStat, cond2, update = false)
+        math.min(1.0, p1 + p2 - (p1 * p2))
 
       case Not(cond) => calculateSingleCondition(planStat, cond, isNot = true, update = false)
       case _ => calculateSingleCondition(planStat, condition, isNot = false, update)
@@ -147,7 +138,7 @@ object FilterEstimation extends Logging {
 
       case Like(_, _) | Contains(_, _) | StartsWith(_, _) | EndsWith(_, _) =>
         /** TODO: it's difficult to support LIKE operator without histogram */
-        logInfo("[CBO] Unsupported filter condition: " + condition)
+        logDebug("[CBO] Unsupported filter condition: " + condition)
         notSupported = true
         1.0
 
@@ -179,21 +170,20 @@ object FilterEstimation extends Logging {
       update: Boolean)
     : Double = {
     if (!planStat.colStats.contains(attrRef.name)) {
-      logInfo("[CBO] No statistics for " + attrRef)
+      logDebug("[CBO] No statistics for " + attrRef)
       return 1.0
     }
     val aColStat = planStat.colStats(attrRef.name)
-    val percent: BigDecimal = planStat.rowCount match {
-      case Some(r) =>
-        if (r == 0) 0.asInstanceOf[BigDecimal]
-        else BigDecimal(aColStat.nullCount) / BigDecimal(r)
-      case None => 0.asInstanceOf[BigDecimal]
-    }
+    val rowCountValue = planStat.rowCount.get
+    val nullPercent: BigDecimal =
+      if (rowCountValue == 0) 0.0
+      else BigDecimal(aColStat.nullCount)/BigDecimal(rowCountValue)
+
     if (update) {
       val newStats = aColStat.copy(nullCount = 0)
       mutableColStats += (attrRef.name -> newStats)
     }
-    1.0 - percent.toDouble
+    1.0 - nullPercent.toDouble
   }
 
   /** This method evaluates binary comparison operators such as =, <, <=, >, >= */
@@ -205,7 +195,7 @@ object FilterEstimation extends Logging {
       update: Boolean)
     : Double = {
     if (!planStat.colStats.contains(attrRef.name)) {
-      logInfo("[CBO] No statistics for " + attrRef)
+      logDebug("[CBO] No statistics for " + attrRef)
       return 1.0
     }
     op match {
@@ -221,10 +211,10 @@ object FilterEstimation extends Logging {
              * TODO: It is difficult to support other binary comparisons for String/Binary
              * type without min/max and histogram.
              */
-            logInfo("[CBO] No statistics for String type " + attrRef)
+            logDebug("[CBO] No statistics for String type " + attrRef)
             return 1.0
           case BinaryType =>
-            logInfo("[CBO] No statistics for Binary type " + attrRef)
+            logDebug("[CBO] No statistics for Binary type " + attrRef)
             return 1.0
         }
     }
@@ -239,21 +229,20 @@ object FilterEstimation extends Logging {
       update: Boolean)
     : Double = {
 
-    var percent: Double = 1.0
     val aColStat = planStat.colStats(attrRef.name)
     val ndv = aColStat.distinctCount
     val datumString = attrRef.dataType match {
       case d: DateType if literal.dataType.isInstanceOf[StringType] =>
         val date = DateTimeUtils.stringToDate(literal.value.asInstanceOf[UTF8String])
         if (date.isEmpty) {
-          logInfo("[CBO] Date literal is wrong, No statistics for " + attrRef)
+          logDebug("[CBO] Date literal is wrong, No statistics for " + attrRef)
           return 1.0
         }
         date.get.toString
       case t: TimestampType if literal.dataType.isInstanceOf[StringType] =>
         val timestamp = DateTimeUtils.stringToTimestamp(literal.value.asInstanceOf[UTF8String])
         if (timestamp.isEmpty) {
-          logInfo("[CBO] Timestamp literal is wrong, No statistics for " + attrRef)
+          logDebug("[CBO] Timestamp literal is wrong, No statistics for " + attrRef)
           return 1.0
         }
         timestamp.get.toString
@@ -298,29 +287,30 @@ object FilterEstimation extends Logging {
       case _ => true
     }
 
-    if (inBoundary) {
-      percent = 1.0 / ndv.toDouble
+    val percent: Double =
+      if (inBoundary) {
 
-      if (update) {
-        /**
-         * We update ColumnStat structure after apply this equality predicate.
-         * Set distinctCount to 1.  Set nullCount to 0.
-         */
-        val newStats = attrRef.dataType match {
-          case dataType: DataType if (dataType.isInstanceOf[NumericType]
-            || dataType.isInstanceOf[DateType]
-            || dataType.isInstanceOf[TimestampType]) =>
-            val newValue = Some(datumString.toDouble)
-            aColStat.copy(distinctCount = 1, min = newValue,
-              max = newValue, nullCount = 0)
-          case _ => aColStat.copy(distinctCount = 1, nullCount = 0)
+        if (update) {
+          /**
+           * We update ColumnStat structure after apply this equality predicate.
+           * Set distinctCount to 1.  Set nullCount to 0.
+           */
+          val newStats = attrRef.dataType match {
+            case dataType: DataType if (dataType.isInstanceOf[NumericType]
+              || dataType.isInstanceOf[DateType]
+              || dataType.isInstanceOf[TimestampType]) =>
+              val newValue = Some(datumString.toDouble)
+              aColStat.copy(distinctCount = 1, min = newValue,
+                max = newValue, nullCount = 0)
+            case _ => aColStat.copy(distinctCount = 1, nullCount = 0)
+          }
+          mutableColStats += (attrRef.name -> newStats)
         }
-        mutableColStats += (attrRef.name -> newStats)
-      }
 
-    } else {
-      percent = 0.0
-    }
+        1.0 / ndv.toDouble
+      } else {
+        0.0
+      }
 
     percent
   }
@@ -332,7 +322,7 @@ object FilterEstimation extends Logging {
       update: Boolean)
     : Double = {
     if (!planStat.colStats.contains(attrRef.name)) {
-      logInfo("[CBO] No statistics for " + attrRef)
+      logDebug("[CBO] No statistics for " + attrRef)
       return 1.0
     }
     // TODO: will fill in this method later.
