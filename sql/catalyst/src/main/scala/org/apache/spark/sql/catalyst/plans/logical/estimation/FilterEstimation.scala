@@ -35,7 +35,6 @@ object FilterEstimation extends Logging {
    * for a column after we apply a predicate condition.
    */
   private var mutableColStats: mutable.Map[String, ColumnStat] = mutable.Map.empty
-  // private val mutableColStats: mutable.Map[String, ColumnStat] = mutable.Map.empty
 
   def estimate(plan: Filter): Option[Statistics] = {
     val stats: Statistics = plan.child.statistics
@@ -138,24 +137,24 @@ object FilterEstimation extends Logging {
         evaluateInSet(planStat, ar, set, update)
 
       /**
-       * TODO: it's difficult to estimate IsNull after outer joins
-       * Hence, we support IsNull and IsNotNull only when the child is a leaf node (table).
+       * It's difficult to estimate IsNull after outer joins.  Hence,
+       * we support IsNull and IsNotNull only when the child is a leaf node (table).
        */
       case IsNull(ExtractAttr(ar)) =>
         if (plan.child.isInstanceOf[LeafNode ]) {
-          evaluateIsNull(planStat, ar, update)
+          evaluateIsNull(planStat, ar, true, update)
         }
         else 1.0
 
       case IsNotNull(ExtractAttr(ar)) =>
         if (plan.child.isInstanceOf[LeafNode ]) {
-          1.0 - evaluateIsNull(planStat, ar, update)
+          evaluateIsNull(planStat, ar, false, update)
         }
         else 1.0
 
       case _ =>
         /**
-         * TODO: it's difficult to support string operators without histogram
+         * TODO: it's difficult to support string operators without advanced statistics.
          * Hence, these string operators Like(_, _) | Contains(_, _) | StartsWith(_, _)
          * | EndsWith(_, _) are not supported yet
          */
@@ -175,6 +174,7 @@ object FilterEstimation extends Logging {
   def evaluateIsNull(
       planStat: Statistics,
       attrRef: AttributeReference,
+      isNull: Boolean,
       update: Boolean)
     : Double = {
     if (!planStat.colStats.contains(attrRef.name)) {
@@ -183,15 +183,26 @@ object FilterEstimation extends Logging {
     }
     val aColStat = planStat.colStats(attrRef.name)
     val rowCountValue = planStat.rowCount.get
-    val percent: BigDecimal =
+    val nullPercent: BigDecimal =
       if (rowCountValue == 0) 0.0
       else BigDecimal(aColStat.nullCount)/BigDecimal(rowCountValue)
 
     if (update) {
-      val newStats = aColStat.copy(nullCount = 0)
+      val newStats =
+        if (isNull) aColStat.copy(distinctCount = 1, min = None, max = None)
+        else aColStat.copy(nullCount = 0)
+
       mutableColStats += (attrRef.name -> newStats)
     }
-    percent.toDouble
+
+    val percent =
+      if (isNull) nullPercent.toDouble
+      else {
+        /** ISNOTNULL(column) */
+        1.0 - nullPercent.toDouble
+      }
+
+    percent
   }
 
   /** This method evaluates binary comparison operators such as =, <, <=, >, >= */
@@ -210,19 +221,14 @@ object FilterEstimation extends Logging {
       case EqualTo(l, r) => evaluateEqualTo(op, planStat, attrRef, literal, update)
       case _ =>
         attrRef.dataType match {
-          case dataType: DataType if (dataType.isInstanceOf[NumericType]
-            || dataType.isInstanceOf[DateType]
-            || dataType.isInstanceOf[TimestampType]) =>
+          case _: NumericType | DateType | TimestampType =>
             evaluateBinaryForNumeric(op, planStat, attrRef, literal, update)
-          case StringType =>
+          case StringType | BinaryType =>
             /**
              * TODO: It is difficult to support other binary comparisons for String/Binary
-             * type without min/max and histogram.
+             * type without min/max and advanced statistics like histogram.
              */
-            logDebug("[CBO] No statistics for String type " + attrRef)
-            return 1.0
-          case BinaryType =>
-            logDebug("[CBO] No statistics for Binary type " + attrRef)
+            logDebug("[CBO] No statistics for String/Binary type " + attrRef)
             return 1.0
         }
     }
@@ -246,18 +252,19 @@ object FilterEstimation extends Logging {
      * Hence, we assume it is in boundary for binary/string type.
      */
     val inBoundary: Boolean = attrRef.dataType match {
-      case dataType: DataType if (dataType.isInstanceOf[NumericType]
-        || dataType.isInstanceOf[DateType]
-        || dataType.isInstanceOf[TimestampType]) =>
-        val statsRange = Range(aColStat.min, aColStat.max, dataType).asInstanceOf[NumericRange]
+      case _: NumericType | DateType | TimestampType =>
+        val statsRange =
+          Range(aColStat.min, aColStat.max, attrRef.dataType).asInstanceOf[NumericRange]
 
         attrRef.dataType match {
-          case intType: DataType if intType.isInstanceOf[IntegralType] =>
+          case _: IntegralType =>
             (BigDecimal(literal.value.asInstanceOf[Long]) >= statsRange.min) &&
               (BigDecimal(literal.value.asInstanceOf[Long]) <= statsRange.max)
-          case fracType: DataType if fracType.isInstanceOf[FractionalType] =>
+
+          case _: FractionalType =>
             (BigDecimal(literal.value.asInstanceOf[Double]) >= statsRange.min) &&
               (BigDecimal(literal.value.asInstanceOf[Double]) <= statsRange.max)
+
           case DateType =>
             val dateLiteral = DateTimeUtils.stringToDate(literal.value.asInstanceOf[UTF8String])
             if (dateLiteral.isEmpty) {
@@ -266,6 +273,7 @@ object FilterEstimation extends Logging {
             }
             val dateBigDecimal = BigDecimal(dateLiteral.asInstanceOf[BigInt])
             (dateBigDecimal >= statsRange.min) && (dateBigDecimal <= statsRange.max)
+
           case TimestampType =>
             val tsLiteral = DateTimeUtils.stringToTimestamp(literal.value.asInstanceOf[UTF8String])
             if (tsLiteral.isEmpty) {
@@ -288,9 +296,7 @@ object FilterEstimation extends Logging {
            * Set distinctCount to 1.  Set nullCount to 0.
            */
           val newStats = attrRef.dataType match {
-            case dataType: DataType if (dataType.isInstanceOf[NumericType]
-              || dataType.isInstanceOf[DateType]
-              || dataType.isInstanceOf[TimestampType]) =>
+            case _: NumericType | DateType | TimestampType =>
               val newValue = Some(literal.value)
               aColStat.copy(distinctCount = 1, min = newValue,
                 max = newValue, nullCount = 0)

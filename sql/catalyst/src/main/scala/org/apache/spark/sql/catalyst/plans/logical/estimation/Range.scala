@@ -47,34 +47,6 @@ object Range {
     case _ => toNumericRange(min.get, max.get, dataType)
   }
 
-  def isIntersected(r1: Range, r2: Range): Boolean = (r1, r2) match {
-    case (_, _: DefaultRange) | (_: DefaultRange, _) =>
-      // Skip overlapping check for binary/string types
-      true
-    case (_, _: NullRange) | (_: NullRange, _) =>
-      false
-    case (n1: NumericRange, n2: NumericRange) =>
-      n1.min.compareTo(n2.max) <= 0 && n1.max.compareTo(n2.min) >= 0
-  }
-
-  /** This is only for two overlapped ranges. */
-  def intersect(
-      r1: Range,
-      r2: Range,
-      dt1: DataType,
-      dt2: DataType): (Option[Any], Option[Any], Option[Any], Option[Any]) = {
-    (r1, r2) match {
-      case (_, _: DefaultRange) | (_: DefaultRange, _) =>
-        // binary/string types don't support intersecting.
-        (None, None, None, None)
-      case (n1: NumericRange, n2: NumericRange) =>
-        val newRange = NumericRange(n1.min.max(n2.min), n1.max.min(n2.max))
-        val (newMin1, newMax1) = fromNumericRange(newRange, dt1)
-        val (newMin2, newMax2) = fromNumericRange(newRange, dt2)
-        (Some(newMin1), Some(newMax1), Some(newMin2), Some(newMax2))
-    }
-  }
-
   /**
    * For simplicity we use decimal to unify operations of numeric types, the two methods below
    * are the contract of conversion.
