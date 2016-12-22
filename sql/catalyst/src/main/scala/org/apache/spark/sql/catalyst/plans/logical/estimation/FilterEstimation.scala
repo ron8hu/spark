@@ -45,7 +45,7 @@ object FilterEstimation extends Logging {
     mutableColStats = mutable.HashMap(stats.colStats.toSeq: _*)
 
     /** estimate selectivity for this filter */
-    val percent: Double = calculateConditions(stats, plan.condition)
+    val percent: Double = calculateConditions(plan, plan.condition)
 
     /** copy mutableColStats contents to an immutable map */
     val newColStats = mutableColStats.toMap
@@ -61,7 +61,7 @@ object FilterEstimation extends Logging {
   }
 
   def calculateConditions(
-      planStat: Statistics,
+      plan: Filter,
       condition: Expression,
       update: Boolean = true)
     : Double = {
@@ -72,25 +72,26 @@ object FilterEstimation extends Logging {
      */
     condition match {
       case And(cond1, cond2) =>
-        calculateConditions(planStat, cond1, update) * calculateConditions(planStat, cond2, update)
+        calculateConditions(plan, cond1, update) * calculateConditions(plan, cond2, update)
 
       case Or(cond1, cond2) =>
-        val p1 = calculateConditions(planStat, cond1, update = false)
-        val p2 = calculateConditions(planStat, cond2, update = false)
+        val p1 = calculateConditions(plan, cond1, update = false)
+        val p2 = calculateConditions(plan, cond2, update = false)
         math.min(1.0, p1 + p2 - (p1 * p2))
 
-      case Not(cond) => calculateSingleCondition(planStat, cond, isNot = true, update = false)
-      case _ => calculateSingleCondition(planStat, condition, isNot = false, update)
+      case Not(cond) => calculateSingleCondition(plan, cond, isNot = true, update = false)
+      case _ => calculateSingleCondition(plan, condition, isNot = false, update)
     }
   }
 
   def calculateSingleCondition(
-      planStat: Statistics,
+      plan: Filter,
       condition: Expression,
       isNot: Boolean,
       update: Boolean)
     : Double = {
     var notSupported: Boolean = false
+    val planStat = plan.child.statistics
     val percent: Double = condition match {
       /**
        * Currently we only support binary predicates where one side is a column,
@@ -136,21 +137,28 @@ object FilterEstimation extends Logging {
       case InSet(ExtractAttr(ar), set) =>
         evaluateInSet(planStat, ar, set, update)
 
-      case Like(_, _) | Contains(_, _) | StartsWith(_, _) | EndsWith(_, _) =>
-        /** TODO: it's difficult to support LIKE operator without histogram */
-        logDebug("[CBO] Unsupported filter condition: " + condition)
-        notSupported = true
-        1.0
-
       /**
        * TODO: it's difficult to estimate IsNull after outer joins
-       * case IsNull(ExtractAttr(ar)) =>
-       * evaluateIsNull(planStat, ar, update)
+       * Hence, we support IsNull and IsNotNull only when the child is a leaf node (table).
        */
+      case IsNull(ExtractAttr(ar)) =>
+        if (plan.child.isInstanceOf[LeafNode ]) {
+          evaluateIsNull(planStat, ar, update)
+        }
+        else 1.0
+
       case IsNotNull(ExtractAttr(ar)) =>
-        evaluateIsNotNull(planStat, ar, update)
+        if (plan.child.isInstanceOf[LeafNode ]) {
+          1.0 - evaluateIsNull(planStat, ar, update)
+        }
+        else 1.0
 
       case _ =>
+        /**
+         * TODO: it's difficult to support string operators without histogram
+         * Hence, these string operators Like(_, _) | Contains(_, _) | StartsWith(_, _)
+         * | EndsWith(_, _) are not supported yet
+         */
         logDebug("[CBO] Unsupported filter condition: " + condition)
         notSupported = true
         1.0
@@ -164,7 +172,7 @@ object FilterEstimation extends Logging {
     }
   }
 
-  def evaluateIsNotNull(
+  def evaluateIsNull(
       planStat: Statistics,
       attrRef: AttributeReference,
       update: Boolean)
@@ -175,7 +183,7 @@ object FilterEstimation extends Logging {
     }
     val aColStat = planStat.colStats(attrRef.name)
     val rowCountValue = planStat.rowCount.get
-    val nullPercent: BigDecimal =
+    val percent: BigDecimal =
       if (rowCountValue == 0) 0.0
       else BigDecimal(aColStat.nullCount)/BigDecimal(rowCountValue)
 
@@ -183,7 +191,7 @@ object FilterEstimation extends Logging {
       val newStats = aColStat.copy(nullCount = 0)
       mutableColStats += (attrRef.name -> newStats)
     }
-    1.0 - nullPercent.toDouble
+    percent.toDouble
   }
 
   /** This method evaluates binary comparison operators such as =, <, <=, >, >= */
@@ -231,44 +239,6 @@ object FilterEstimation extends Logging {
 
     val aColStat = planStat.colStats(attrRef.name)
     val ndv = aColStat.distinctCount
-    val datumString = attrRef.dataType match {
-      case d: DateType if literal.dataType.isInstanceOf[StringType] =>
-        val date = DateTimeUtils.stringToDate(literal.value.asInstanceOf[UTF8String])
-        if (date.isEmpty) {
-          logDebug("[CBO] Date literal is wrong, No statistics for " + attrRef)
-          return 1.0
-        }
-        date.get.toString
-      case t: TimestampType if literal.dataType.isInstanceOf[StringType] =>
-        val timestamp = DateTimeUtils.stringToTimestamp(literal.value.asInstanceOf[UTF8String])
-        if (timestamp.isEmpty) {
-          logDebug("[CBO] Timestamp literal is wrong, No statistics for " + attrRef)
-          return 1.0
-        }
-        timestamp.get.toString
-      case _ => literal.value.toString
-    }
-
-    val minString: String = attrRef.dataType match {
-      case dataType: DataType if (dataType.isInstanceOf[NumericType]
-        || dataType.isInstanceOf[DateType]
-        || dataType.isInstanceOf[TimestampType]) =>
-        aColStat.min match {
-          case Some(v) => v.toString
-          case None => ""
-        }
-      case _ => ""
-    }
-    val maxString: String = attrRef.dataType match {
-      case dataType: DataType if (dataType.isInstanceOf[NumericType]
-        || dataType.isInstanceOf[DateType]
-        || dataType.isInstanceOf[TimestampType]) =>
-        aColStat.max match {
-          case Some(v) => v.toString
-          case None => ""
-        }
-      case _ => ""
-    }
 
     /**
      * decide if the value is in [min, max] of the column.
@@ -279,12 +249,34 @@ object FilterEstimation extends Logging {
       case dataType: DataType if (dataType.isInstanceOf[NumericType]
         || dataType.isInstanceOf[DateType]
         || dataType.isInstanceOf[TimestampType]) =>
-        aColStat.min match {
-          case Some(v) =>
-            datumString.toDouble >= minString.toDouble && datumString.toDouble <= maxString.toDouble
-          case None => true
+        val statsRange = Range(aColStat.min, aColStat.max, dataType).asInstanceOf[NumericRange]
+
+        attrRef.dataType match {
+          case intType: DataType if intType.isInstanceOf[IntegralType] =>
+            (BigDecimal(literal.value.asInstanceOf[Long]) >= statsRange.min) &&
+              (BigDecimal(literal.value.asInstanceOf[Long]) <= statsRange.max)
+          case fracType: DataType if fracType.isInstanceOf[FractionalType] =>
+            (BigDecimal(literal.value.asInstanceOf[Double]) >= statsRange.min) &&
+              (BigDecimal(literal.value.asInstanceOf[Double]) <= statsRange.max)
+          case DateType =>
+            val dateLiteral = DateTimeUtils.stringToDate(literal.value.asInstanceOf[UTF8String])
+            if (dateLiteral.isEmpty) {
+              logDebug("[CBO] Date literal is wrong, No statistics for " + attrRef)
+              return 1.0
+            }
+            val dateBigDecimal = BigDecimal(dateLiteral.asInstanceOf[BigInt])
+            (dateBigDecimal >= statsRange.min) && (dateBigDecimal <= statsRange.max)
+          case TimestampType =>
+            val tsLiteral = DateTimeUtils.stringToTimestamp(literal.value.asInstanceOf[UTF8String])
+            if (tsLiteral.isEmpty) {
+              logDebug("[CBO] Timestamp literal is wrong, No statistics for " + attrRef)
+              return 1.0
+            }
+            val tsBigDecimal = BigDecimal(tsLiteral.asInstanceOf[BigInt])
+            (tsBigDecimal >= statsRange.min) && (tsBigDecimal <= statsRange.max)
         }
-      case _ => true
+
+      case _ => true  /** for String/Binary type */
     }
 
     val percent: Double =
@@ -299,7 +291,7 @@ object FilterEstimation extends Logging {
             case dataType: DataType if (dataType.isInstanceOf[NumericType]
               || dataType.isInstanceOf[DateType]
               || dataType.isInstanceOf[TimestampType]) =>
-              val newValue = Some(datumString.toDouble)
+              val newValue = Some(literal.value)
               aColStat.copy(distinctCount = 1, min = newValue,
                 max = newValue, nullCount = 0)
             case _ => aColStat.copy(distinctCount = 1, nullCount = 0)
